@@ -80,3 +80,8 @@ type metadata_t struct {
 	//dirs                 [DIR_NUM]data_directory_t
 	Data [18592]uint8
 }
+
+type TokenGob struct {
+	Token []byte
+	Meta  metadata_t
+}

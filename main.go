@@ -15,6 +15,7 @@ import (
 	"io/ioutil"
 	"math/big"
 	"net"
+	"os"
 	"unsafe"
 
 	"github.com/golang/protobuf/proto"
@@ -24,6 +25,7 @@ const (
 	aesm_socket  = "/var/run/aesmd/aesm.socket"
 	target_meta  = "/tmp/gobdump_meta.dat"
 	target_token = "/tmp/gobdump_req.dat"
+	tokenfile    = "/tmp/go_enclave.token"
 )
 
 var (
@@ -196,6 +198,8 @@ func main() {
 		meta.Enclave_css.Buffer.Q2[i] = pQ2Bytes[SE_KEY_SIZE-1-i]
 	}
 
+	fmt.Println(meta.Enclave_css.Key.Exponent)
+
 	//TODO not sure what the dir is supposed to be.
 	//TODO not sure what the size is supposed to be either.
 
@@ -242,5 +246,24 @@ func main() {
 	// Convert the repsonse.
 	response := &Response{}
 	proto.Unmarshal(content, response)
-	fmt.Println(response)
+	if response.GetLicTokenRes == nil {
+		panic("unable to get a response.")
+	}
+
+	if *response.GetLicTokenRes.ErrorCode != 0 {
+		fmt.Println("Error code getlictoken ", *response.GetLicTokenRes.ErrorCode)
+		panic("Failure to get the token.")
+	}
+
+	// Write down the token.
+	var tkg TokenGob
+	tkg.Token = response.GetLicTokenRes.Token
+	tkg.Meta = meta
+
+	tok_file, err := os.Create(tokenfile)
+	check(err)
+	enc := gob.NewEncoder(tok_file)
+	err = enc.Encode(&tkg)
+	check(err)
+	fmt.Println("Done creating the token")
 }
