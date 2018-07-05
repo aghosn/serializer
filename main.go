@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"math/big"
 	"net"
 	"os"
@@ -26,6 +27,9 @@ const (
 	target_meta  = "/tmp/gobdump_meta.dat"
 	target_token = "/tmp/gobdump_req.dat"
 	tokenfile    = "/tmp/go_enclave.token"
+	cssSize      = 1808
+	headSize     = 128
+	bodySize     = 128
 )
 
 var (
@@ -86,15 +90,15 @@ func check(err error) {
 	}
 }
 
-func main() {
+func getMetaNToken() (*metadata_t, *LaunchTokenRequest) {
 	b, err := ioutil.ReadFile(target_meta)
 	check(err)
 
 	dec := gob.NewDecoder(bytes.NewReader(b))
 
-	var meta metadata_t
+	meta := &metadata_t{}
 
-	err = dec.Decode(&meta)
+	err = dec.Decode(meta)
 	check(err)
 
 	// decode token
@@ -102,10 +106,13 @@ func main() {
 	check(err)
 
 	dec = gob.NewDecoder(bytes.NewReader(b))
-	var tok LaunchTokenRequest
-	err = dec.Decode(&tok)
+	tok := &LaunchTokenRequest{}
+	err = dec.Decode(tok)
 	check(err)
+	return meta, tok
+}
 
+func getKey() *rsa.PrivateKey {
 	// Parse the rsa key as well.
 	block, _ := pem.Decode(privateKey)
 	if block.Type != "RSA PRIVATE KEY" {
@@ -113,14 +120,41 @@ func main() {
 	}
 	key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
 	check(err)
+	return key
+}
 
-	// Set up the keys.
-	for i := range meta.Enclave_css.Key.Exponent {
-		meta.Enclave_css.Key.Exponent[i] = 0
+func computeQ1Q2(bigMod, bigSig *big.Int) ([]byte, []byte) {
+	ptemp1 := big.NewInt(int64(0))
+	ptemp1.Mul(bigSig, bigSig)
+	pQ1, ptemp2 := big.NewInt(int64(0)), big.NewInt(int64(0))
+	pQ1.QuoRem(ptemp1, bigMod, ptemp2)
+	ptemp1.Mul(bigSig, ptemp2)
+	pQ2 := big.NewInt(int64(0))
+	pQ2.QuoRem(ptemp1, bigMod, ptemp2)
+
+	pQ1Bytes := pQ1.Bytes()
+	pQ2Bytes := pQ2.Bytes()
+
+	if len(pQ1Bytes) != SE_KEY_SIZE || len(pQ2Bytes) != SE_KEY_SIZE {
+		panic("Wrong pq sizes")
 	}
 
-	for i := range meta.Enclave_css.Key.Modulus {
-		meta.Enclave_css.Key.Modulus[i] = 0
+	return pQ1Bytes, pQ2Bytes
+}
+
+func main() {
+
+	meta, tok := getMetaNToken()
+
+	key := getKey()
+
+	// Set up the keys.
+	for i := range meta.Enclave_css.Exponent {
+		meta.Enclave_css.Exponent[i] = 0
+	}
+
+	for i := range meta.Enclave_css.Modulus {
+		meta.Enclave_css.Modulus[i] = 0
 	}
 
 	exponentByte := make([]byte, SE_EXPONENT_SIZE)
@@ -129,7 +163,7 @@ func main() {
 		panic("Wrong conversion of exponent.")
 	}
 	for i := range exponentByte {
-		meta.Enclave_css.Key.Exponent[i] = exponentByte[i]
+		meta.Enclave_css.Exponent[i] = exponentByte[i]
 	}
 
 	modByte := key.N.Bytes()
@@ -137,21 +171,25 @@ func main() {
 		panic("Wrong size for modulus in bytes.")
 	}
 	for i := range modByte {
-		meta.Enclave_css.Key.Modulus[i] = modByte[SE_KEY_SIZE-1-i]
+		meta.Enclave_css.Modulus[i] = modByte[SE_KEY_SIZE-1-i]
 	}
 
 	// Do the signature.
-	buff_size := int(unsafe.Sizeof(meta.Enclave_css.Header) + unsafe.Sizeof(meta.Enclave_css.Body))
+	if sh := unsafe.Sizeof(meta.Enclave_css); sh != cssSize {
+		log.Fatalln("Wrong header size, expected 128, found ", sh)
+	}
+
+	buff_size := headSize + bodySize
 	temp_buffer := make([]byte, buff_size)
 
 	base := unsafe.Pointer(&(meta.Enclave_css.Header))
-	for i := uintptr(0); i < unsafe.Sizeof(meta.Enclave_css.Header); i++ {
+	for i := uintptr(0); i < uintptr(headSize); i++ {
 		val := (*byte)(unsafe.Pointer(uintptr(base) + i))
 		temp_buffer[i] = *val
 	}
 
-	base = unsafe.Pointer(&(meta.Enclave_css.Body))
-	for i := unsafe.Sizeof(meta.Enclave_css.Header); i < uintptr(buff_size); i++ {
+	base = unsafe.Pointer(&(meta.Enclave_css.Misc_select))
+	for i := uintptr(headSize); i < uintptr(buff_size); i++ {
 		val := (*byte)(unsafe.Pointer(uintptr(base) + i))
 		temp_buffer[i] = *val
 	}
@@ -159,16 +197,15 @@ func main() {
 	signHB := sha256.Sum256(temp_buffer)
 	signed, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, signHB[:])
 	check(err)
-	//fmt.Println(signed)
 
 	//TODO in the code they seem to reverse the order of bytes here.
 	for i := 0; i < len(signed); i++ {
-		meta.Enclave_css.Key.Signature[i] = signed[len(signed)-1-i]
+		meta.Enclave_css.Signature[i] = signed[len(signed)-1-i]
 	}
 	//TODO modulus is probably not set yet. Need to set it up.
 	modulus := make([]byte, SE_KEY_SIZE)
 	for i := range modulus {
-		modulus[i] = meta.Enclave_css.Key.Modulus[SE_KEY_SIZE-1-i]
+		modulus[i] = meta.Enclave_css.Modulus[SE_KEY_SIZE-1-i]
 	}
 
 	// Compute the RSA q1 and q2
@@ -178,35 +215,17 @@ func main() {
 	var bigSig big.Int
 	bigSig.SetBytes(signed)
 
-	ptemp1 := big.NewInt(int64(0))
-	ptemp1.Mul(&bigSig, &bigSig)
-	pQ1, ptemp2 := big.NewInt(int64(0)), big.NewInt(int64(0))
-	pQ1.QuoRem(ptemp1, &bigMod, ptemp2)
-	ptemp1.Mul(&bigSig, ptemp2)
-	pQ2 := big.NewInt(int64(0))
-	pQ2.QuoRem(ptemp1, &bigMod, ptemp2)
-
-	pQ1Bytes := pQ1.Bytes()
-	pQ2Bytes := pQ2.Bytes()
-
-	if len(pQ1Bytes) != SE_KEY_SIZE || len(pQ2Bytes) != SE_KEY_SIZE {
-		panic("Wrong pq sizes")
-	}
+	pQ1Bytes, pQ2Bytes := computeQ1Q2(&bigMod, &bigSig)
 
 	for i := 0; i < SE_KEY_SIZE; i++ {
-		meta.Enclave_css.Buffer.Q1[i] = pQ1Bytes[SE_KEY_SIZE-1-i]
-		meta.Enclave_css.Buffer.Q2[i] = pQ2Bytes[SE_KEY_SIZE-1-i]
+		meta.Enclave_css.Q1[i] = pQ1Bytes[SE_KEY_SIZE-1-i]
+		meta.Enclave_css.Q2[i] = pQ2Bytes[SE_KEY_SIZE-1-i]
 	}
-
-	fmt.Println(meta.Enclave_css.Key.Exponent)
-
-	//TODO not sure what the dir is supposed to be.
-	//TODO not sure what the size is supposed to be either.
 
 	timeout := uint32(1000)
 	req := Request{}
-	tok.MrEnclave = meta.Enclave_css.Body.Enclave_hash.M[:]
-	tok.MrSigner = meta.Enclave_css.Key.Modulus[:]
+	tok.MrEnclave = meta.Enclave_css.Enclave_hash.M[:]
+	tok.MrSigner = meta.Enclave_css.Modulus[:]
 	tok.Timeout = &timeout
 	req.GetLicTokenReq = &Request_GetLaunchTokenRequest{tok.MrEnclave,
 		tok.MrSigner, tok.SeAttributes, tok.Timeout, tok.XXX_unrecognized}
@@ -258,7 +277,7 @@ func main() {
 	// Write down the token.
 	var tkg TokenGob
 	tkg.Token = response.GetLicTokenRes.Token
-	tkg.Meta = meta
+	tkg.Meta = *meta
 
 	tok_file, err := os.Create(tokenfile)
 	check(err)
