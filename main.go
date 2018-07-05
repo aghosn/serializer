@@ -139,7 +139,25 @@ func computeQ1Q2(bigMod, bigSig *big.Int) ([]byte, []byte) {
 		panic("Wrong pq sizes")
 	}
 
-	return pQ1Bytes, pQ2Bytes
+	lepq1, lepq2 := make([]byte, len(pQ1Bytes)), make([]byte, len(pQ2Bytes))
+	for i := range pQ1Bytes {
+		lepq1[i] = pQ1Bytes[len(pQ1Bytes)-1-i]
+		lepq2[i] = pQ2Bytes[len(pQ2Bytes)-1-i]
+	}
+
+	return lepq1, lepq2
+}
+
+func signHashedData(key *rsa.PrivateKey, content []byte) ([]byte, []byte) {
+	signedBE, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, content)
+	check(err)
+
+	//reverse the signature
+	signedLE := make([]byte, len(signedBE))
+	for i := 0; i < len(signedBE); i++ {
+		signedLE[i] = signedBE[len(signedBE)-1-i]
+	}
+	return signedLE, signedBE
 }
 
 func main() {
@@ -195,12 +213,11 @@ func main() {
 	}
 
 	signHB := sha256.Sum256(temp_buffer)
-	signed, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, signHB[:])
-	check(err)
 
-	//TODO in the code they seem to reverse the order of bytes here.
-	for i := 0; i < len(signed); i++ {
-		meta.Enclave_css.Signature[i] = signed[len(signed)-1-i]
+	signedLE, signedBE := signHashedData(key, signHB[:])
+
+	for i := 0; i < len(signedLE); i++ {
+		meta.Enclave_css.Signature[i] = signedLE[i]
 	}
 	//TODO modulus is probably not set yet. Need to set it up.
 	modulus := make([]byte, SE_KEY_SIZE)
@@ -213,13 +230,13 @@ func main() {
 	bigMod.SetBytes(modulus)
 
 	var bigSig big.Int
-	bigSig.SetBytes(signed)
+	bigSig.SetBytes(signedBE)
 
 	pQ1Bytes, pQ2Bytes := computeQ1Q2(&bigMod, &bigSig)
 
 	for i := 0; i < SE_KEY_SIZE; i++ {
-		meta.Enclave_css.Q1[i] = pQ1Bytes[SE_KEY_SIZE-1-i]
-		meta.Enclave_css.Q2[i] = pQ2Bytes[SE_KEY_SIZE-1-i]
+		meta.Enclave_css.Q1[i] = pQ1Bytes[i]
+		meta.Enclave_css.Q2[i] = pQ2Bytes[i]
 	}
 
 	timeout := uint32(1000)
