@@ -265,5 +265,6 @@ func main() {
 	enc := gob.NewEncoder(tok_file)
 	err = enc.Encode(&tkg)
 	check(err)
+	fmt.Println("The size of the token: ", len(response.GetLicTokenRes.Token))
 	fmt.Println("Done creating the token")
 }
