@@ -30,6 +30,7 @@ const (
 	cssSize      = 1808
 	headSize     = 128
 	bodySize     = 128
+	keySize      = 772
 )
 
 var (
@@ -90,8 +91,8 @@ func check(err error) {
 	}
 }
 
-func getMetaNToken() (*metadata_t, *LaunchTokenRequest) {
-	b, err := ioutil.ReadFile(target_meta)
+func getMetaNToken(tmeta, ttok string, key *rsa.PrivateKey) (*metadata_t, *LaunchTokenRequest) {
+	b, err := ioutil.ReadFile(tmeta)
 	check(err)
 
 	dec := gob.NewDecoder(bytes.NewReader(b))
@@ -102,13 +103,39 @@ func getMetaNToken() (*metadata_t, *LaunchTokenRequest) {
 	check(err)
 
 	// decode token
-	b, err = ioutil.ReadFile(target_token)
+	b, err = ioutil.ReadFile(ttok)
 	check(err)
 
 	dec = gob.NewDecoder(bytes.NewReader(b))
 	tok := &LaunchTokenRequest{}
 	err = dec.Decode(tok)
 	check(err)
+
+	for i := range meta.Enclave_css.Exponent {
+		meta.Enclave_css.Exponent[i] = 0
+	}
+
+	for i := range meta.Enclave_css.Modulus {
+		meta.Enclave_css.Modulus[i] = 0
+	}
+	// Set up the keys.
+	exponentByte := make([]byte, SE_EXPONENT_SIZE)
+	binary.LittleEndian.PutUint32(exponentByte, uint32(key.E))
+	if exponentByte[0] != 0x03 {
+		panic("Wrong conversion of exponent.")
+	}
+	for i := range exponentByte {
+		meta.Enclave_css.Exponent[i] = exponentByte[i]
+	}
+
+	modByte := key.N.Bytes()
+	if len(modByte) != SE_KEY_SIZE {
+		panic("Wrong size for modulus in bytes.")
+	}
+	for i := range modByte {
+		meta.Enclave_css.Modulus[i] = modByte[SE_KEY_SIZE-1-i]
+	}
+
 	return meta, tok
 }
 
@@ -135,14 +162,25 @@ func computeQ1Q2(bigMod, bigSig *big.Int) ([]byte, []byte) {
 	pQ1Bytes := pQ1.Bytes()
 	pQ2Bytes := pQ2.Bytes()
 
-	if len(pQ1Bytes) != SE_KEY_SIZE || len(pQ2Bytes) != SE_KEY_SIZE {
-		panic("Wrong pq sizes")
+	//if len(pQ1Bytes) != SE_KEY_SIZE || len(pQ2Bytes) != SE_KEY_SIZE {
+	//	fmt.Println("len one ", len(pQ1Bytes), " len two ", len(pQ2Bytes))
+	//	panic("Wrong pq sizes")
+	//}
+	sq1 := len(pQ1Bytes)
+	sq2 := len(pQ2Bytes)
+	if sq1 > SE_KEY_SIZE {
+		sq1 = SE_KEY_SIZE
+	}
+	if sq2 > SE_KEY_SIZE {
+		sq2 = SE_KEY_SIZE
 	}
 
-	lepq1, lepq2 := make([]byte, len(pQ1Bytes)), make([]byte, len(pQ2Bytes))
-	for i := range pQ1Bytes {
-		lepq1[i] = pQ1Bytes[len(pQ1Bytes)-1-i]
-		lepq2[i] = pQ2Bytes[len(pQ2Bytes)-1-i]
+	lepq1, lepq2 := make([]byte, sq1), make([]byte, sq2)
+	for i := 0; i < sq1; i++ {
+		lepq1[i] = pQ1Bytes[sq1-1-i]
+	}
+	for i := 0; i < sq2; i++ {
+		lepq2[i] = pQ2Bytes[sq2-1-i]
 	}
 
 	return lepq1, lepq2
@@ -160,59 +198,37 @@ func signHashedData(key *rsa.PrivateKey, content []byte) ([]byte, []byte) {
 	return signedLE, signedBE
 }
 
+func getHashedCss(css *enclave_css_t) [32]byte {
+	buff_size := headSize + bodySize
+	temp_buffer := make([]byte, buff_size)
+
+	base := unsafe.Pointer(&(css.Header))
+	for i := uintptr(0); i < uintptr(headSize); i++ {
+		val := (*byte)(unsafe.Pointer(uintptr(base) + i))
+		temp_buffer[i] = *val
+	}
+
+	base = unsafe.Pointer(&(css.Misc_select))
+	for i := uintptr(0); i < uintptr(bodySize); i++ {
+		val := (*byte)(unsafe.Pointer(uintptr(base) + i))
+		temp_buffer[headSize+i] = *val
+	}
+
+	signHB := sha256.Sum256(temp_buffer)
+	return signHB
+}
+
 func main() {
 
-	meta, tok := getMetaNToken()
-
 	key := getKey()
-
-	// Set up the keys.
-	for i := range meta.Enclave_css.Exponent {
-		meta.Enclave_css.Exponent[i] = 0
-	}
-
-	for i := range meta.Enclave_css.Modulus {
-		meta.Enclave_css.Modulus[i] = 0
-	}
-
-	exponentByte := make([]byte, SE_EXPONENT_SIZE)
-	binary.LittleEndian.PutUint32(exponentByte, uint32(key.E))
-	if exponentByte[0] != 0x03 {
-		panic("Wrong conversion of exponent.")
-	}
-	for i := range exponentByte {
-		meta.Enclave_css.Exponent[i] = exponentByte[i]
-	}
-
-	modByte := key.N.Bytes()
-	if len(modByte) != SE_KEY_SIZE {
-		panic("Wrong size for modulus in bytes.")
-	}
-	for i := range modByte {
-		meta.Enclave_css.Modulus[i] = modByte[SE_KEY_SIZE-1-i]
-	}
+	meta, tok := getMetaNToken(target_meta, target_token, key)
 
 	// Do the signature.
 	if sh := unsafe.Sizeof(meta.Enclave_css); sh != cssSize {
 		log.Fatalln("Wrong header size, expected 128, found ", sh)
 	}
 
-	buff_size := headSize + bodySize
-	temp_buffer := make([]byte, buff_size)
-
-	base := unsafe.Pointer(&(meta.Enclave_css.Header))
-	for i := uintptr(0); i < uintptr(headSize); i++ {
-		val := (*byte)(unsafe.Pointer(uintptr(base) + i))
-		temp_buffer[i] = *val
-	}
-
-	base = unsafe.Pointer(&(meta.Enclave_css.Misc_select))
-	for i := uintptr(headSize); i < uintptr(buff_size); i++ {
-		val := (*byte)(unsafe.Pointer(uintptr(base) + i))
-		temp_buffer[i] = *val
-	}
-
-	signHB := sha256.Sum256(temp_buffer)
+	signHB := getHashedCss(&meta.Enclave_css)
 
 	signedLE, signedBE := signHashedData(key, signHB[:])
 
@@ -234,8 +250,10 @@ func main() {
 
 	pQ1Bytes, pQ2Bytes := computeQ1Q2(&bigMod, &bigSig)
 
-	for i := 0; i < SE_KEY_SIZE; i++ {
+	for i := 0; i < len(pQ1Bytes); i++ {
 		meta.Enclave_css.Q1[i] = pQ1Bytes[i]
+	}
+	for i := 0; i < len(pQ2Bytes); i++ {
 		meta.Enclave_css.Q2[i] = pQ2Bytes[i]
 	}
 
